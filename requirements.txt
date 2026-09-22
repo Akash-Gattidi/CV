@@ -1,0 +1,19 @@
+# Core Vision and Math
+numpy<2.0
+scipy
+opencv-python-headless
+Pillow
+matplotlib
+tqdm
+plyfile
+trimesh
+
+# Deep Learning & Transformers (DUSt3R / MASt3R backbone)
+timm
+einops
+huggingface-hub
+safetensors
+
+# Mesh & Geometry Processing
+scikit-learn
+open3d
