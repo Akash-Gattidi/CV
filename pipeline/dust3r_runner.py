@@ -63,19 +63,8 @@ class DUSt3RGeometryEstimator:
         # 1. Load images with dust3r utilities (preserves dimensions)
         images = load_images(image_paths, size=512)
 
-        # 2. Build memory-efficient scene graph (consecutive + step skip for baseline)
-        pairs = []
-        for i in range(n_images):
-            # Connect to adjacent frame
-            if i + 1 < n_images:
-                pairs.append((i, i + 1))
-            # Connect to 2nd frame for multi-view triangulation
-            if i + 2 < n_images:
-                pairs.append((i, i + 2))
-            # Connect every 4th frame for loop stabilization
-            if i + 4 < n_images and i % 2 == 0:
-                pairs.append((i, i + 4))
-
+        # 2. Build memory-efficient scene graph (sliding window 3 along video sequence)
+        pairs = make_pairs(images, scene_graph="swin-3-noncyclic", symmetrize=True)
         print(f"[DUSt3R] Formed {len(pairs)} pairwise graph edges for inference.")
 
         # 3. Run pairwise inference in fp16, batch_size=1 to ensure peak VRAM < 3.5GB
@@ -87,6 +76,7 @@ class DUSt3RGeometryEstimator:
                 batch_size=1,
                 verbose=True
             )
+
 
         # Clear PyTorch caching to free activation memory before global alignment
         if torch.cuda.is_available():
@@ -113,13 +103,24 @@ class DUSt3RGeometryEstimator:
         print(f"[DUSt3R] Global alignment finished. Final alignment loss: {loss:.4f}")
 
         # 5. Extract camera poses & intrinsics
-        # scene.imgs contains original loaded images
-        # scene.get_im_poses() returns (N, 4, 4) camera-to-world transformation matrices
-        # scene.get_focals() returns focal lengths
-        # scene.get_principal_points() returns principal points
-        poses = scene.get_im_poses().detach().cpu().numpy()  # (N, 4, 4) c2w
-        focals = scene.get_focals().detach().cpu().numpy()   # (N, 1) or (N, 2)
-        pps = scene.get_principal_points().detach().cpu().numpy() # (N, 2)
+        poses = scene.get_im_poses()
+        if torch.is_tensor(poses):
+            poses = poses.detach().cpu().numpy()
+        elif isinstance(poses, (list, tuple)):
+            poses = np.array([p.detach().cpu().numpy() if torch.is_tensor(p) else np.array(p) for p in poses])
+
+        focals = scene.get_focals()
+        if torch.is_tensor(focals):
+            focals = focals.detach().cpu().numpy()
+        elif isinstance(focals, (list, tuple)):
+            focals = [f.detach().cpu().numpy() if torch.is_tensor(f) else np.array(f) for f in focals]
+
+        pps = scene.get_principal_points()
+        if torch.is_tensor(pps):
+            pps = pps.detach().cpu().numpy()
+        elif isinstance(pps, (list, tuple)):
+            pps = [p.detach().cpu().numpy() if torch.is_tensor(p) else np.array(p) for p in pps]
+
         pts3d = scene.get_pts3d()  # list of (H, W, 3)
         confs = scene.get_conf()   # list of (H, W)
 
@@ -129,9 +130,10 @@ class DUSt3RGeometryEstimator:
 
         for idx, img_path in enumerate(image_paths):
             h, w = images[idx]["true_shape"][0].tolist()
-            f = float(focals[idx][0]) if hasattr(focals[idx], "__len__") else float(focals[idx])
+            f_val = focals[idx]
+            f = float(f_val[0]) if hasattr(f_val, "__len__") else float(f_val)
             cx, cy = float(pps[idx][0]), float(pps[idx][1])
-            c2w = poses[idx].tolist()
+            c2w = poses[idx].tolist() if hasattr(poses[idx], "tolist") else poses[idx]
 
             # World to Camera: inv(c2w)
             c2w_mat = np.array(c2w, dtype=np.float64)
@@ -147,15 +149,18 @@ class DUSt3RGeometryEstimator:
                 "fy": f,
                 "cx": cx,
                 "cy": cy,
-                "c2w": c2w,
+                "c2w": c2w_mat.tolist(),
                 "w2c": w2c_mat.tolist()
             }
             camera_data.append(cam_info)
 
             # Filter dense 3D points by confidence
-            p3d = pts3d[idx].detach().cpu().numpy()  # (H, W, 3)
-            conf = confs[idx].detach().cpu().numpy()  # (H, W)
+            p3d_tensor = pts3d[idx]
+            p3d = p3d_tensor.detach().cpu().numpy() if torch.is_tensor(p3d_tensor) else np.array(p3d_tensor)
+            conf_tensor = confs[idx]
+            conf = conf_tensor.detach().cpu().numpy() if torch.is_tensor(conf_tensor) else np.array(conf_tensor)
             rgb = (images[idx]["img"][0].permute(1, 2, 0).detach().cpu().numpy() + 1.0) / 2.0  # (H, W, 3) in [0, 1]
+
 
             mask = conf > self.confidence_threshold
             valid_p3d = p3d[mask]
