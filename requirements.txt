@@ -11,8 +11,10 @@ trimesh
 # Deep Learning & Transformers (DUSt3R / MASt3R backbone)
 timm
 einops
+roma
 huggingface-hub
 safetensors
+
 
 # Mesh & Geometry Processing
 scikit-learn
