@@ -44,15 +44,36 @@ def run_milestone_1(
     # Step 2: DUSt3R Geometry & Pose Estimation (Handles Blank Walls)
     print("\n--- STEP 2: DUST3R DENSE GEOMETRY & CAMERA POSE ESTIMATION ---")
     dust3r_dir = os.path.join("output", "dust3r")
-    weights_path = os.path.join("checkpoints", "dust3r_512")
-    estimator = DUSt3RGeometryEstimator(model_name=weights_path)
-    dust3r_results = estimator.run_reconstruction(
-        image_paths=image_paths,
-        output_dir=dust3r_dir,
-        n_iters=200,
-        voxel_downsample=voxel_size
-    )
-    print("Step 2 Complete: DUSt3R camera poses and 3D pointmaps generated.")
+    cameras_json_path = os.path.join(dust3r_dir, "cameras.json")
+    ply_path = os.path.join(dust3r_dir, "dust3r_points.ply")
+
+    if os.path.exists(cameras_json_path) and os.path.exists(ply_path):
+        print(f"[DUSt3R] Found existing reconstruction at {dust3r_dir}. Loading cached geometry and camera poses...")
+        with open(cameras_json_path, "r") as f:
+            camera_data = json.load(f)
+        import plyfile
+        ply_data = plyfile.PlyData.read(ply_path)
+        pts = np.stack([ply_data['vertex']['x'], ply_data['vertex']['y'], ply_data['vertex']['z']], axis=-1).astype(np.float32)
+        colors = (np.stack([ply_data['vertex']['red'], ply_data['vertex']['green'], ply_data['vertex']['blue']], axis=-1) / 255.0).astype(np.float32)
+        dust3r_results = {
+            "cameras_json": cameras_json_path,
+            "ply_path": ply_path,
+            "points": pts,
+            "colors": colors,
+            "cameras": camera_data
+        }
+        print(f"[DUSt3R] Loaded {len(pts)} 3D points and {len(camera_data)} camera poses from cache.")
+    else:
+        weights_path = os.path.join("checkpoints", "dust3r_512")
+        estimator = DUSt3RGeometryEstimator(model_name=weights_path)
+        dust3r_results = estimator.run_reconstruction(
+            image_paths=image_paths,
+            output_dir=dust3r_dir,
+            n_iters=200,
+            voxel_downsample=voxel_size
+        )
+        print("Step 2 Complete: DUSt3R camera poses and 3D pointmaps generated.")
+
 
     # Step 3: Splat Initialization (Direct from DUSt3R, No COLMAP)
     print("\n--- STEP 3: INITIALIZING 3D GAUSSIAN SPLATS ---")
