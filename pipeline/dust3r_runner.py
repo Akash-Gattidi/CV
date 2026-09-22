@@ -32,7 +32,7 @@ class DUSt3RGeometryEstimator:
         self,
         model_name: str = "naver/DUSt3R_ViTLarge_BaseDecoder_512_dpt",
         device: str = "cuda",
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype = torch.float32,
         confidence_threshold: float = 1.5
     ):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
