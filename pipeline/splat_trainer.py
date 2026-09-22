@@ -278,63 +278,70 @@ class DifferentiableSplatRenderer:
             indexing="ij"
         )
         pixels = torch.stack([x_coords, y_coords], dim=-1)  # (H, W, 2)
-
-        # Tiled or chunked rendering to bound activation memory
-        out_image = torch.zeros((height, width, 3), dtype=torch.float32, device=device)
-        transmittance = torch.ones((height, width), dtype=torch.float32, device=device)
-
-        # Process Gaussians in chunks
-        chunk_size = 512
-        N = means_2d.shape[0]
-
-        for start in range(0, N, chunk_size):
-            end = min(start + chunk_size, N)
-            m_chunk = means_2d[start:end]        # (C, 2)
-            inv_chunk = inv_cov[start:end]      # (C, 2, 2)
-            c_chunk = colors[start:end]          # (C, 3)
-            op_chunk = opacities[start:end]      # (C)
-            rad_chunk = radii[start:end]        # (C)
-
-            # Bounding box of chunk in screen space
-            min_x = int(torch.clamp(m_chunk[:, 0].min() - rad_chunk.max(), 0, width).item())
-            max_x = int(torch.clamp(m_chunk[:, 0].max() + rad_chunk.max() + 1, 0, width).item())
-            min_y = int(torch.clamp(m_chunk[:, 1].min() - rad_chunk.max(), 0, height).item())
-            max_y = int(torch.clamp(m_chunk[:, 1].max() + rad_chunk.max() + 1, 0, height).item())
-
-            if min_x >= max_x or min_y >= max_y:
-                continue
-
-            sub_pix = pixels[min_y:max_y, min_x:max_x]  # (sub_H, sub_W, 2)
-            sub_T = transmittance[min_y:max_y, min_x:max_x]
-            sub_out = out_image[min_y:max_y, min_x:max_x]
-
-            # Vectorized evaluation for active chunk
-            diff = sub_pix.unsqueeze(2) - m_chunk.unsqueeze(0).unsqueeze(0)  # (sub_H, sub_W, C, 2)
-            power = -0.5 * (
-                diff[..., 0] * (diff[..., 0] * inv_chunk[:, 0, 0] + diff[..., 1] * inv_chunk[:, 1, 0]) +
-                diff[..., 1] * (diff[..., 0] * inv_chunk[:, 0, 1] + diff[..., 1] * inv_chunk[:, 1, 1])
-            )
-            # Alpha for this chunk
-            alpha = torch.clamp(op_chunk * torch.exp(torch.clamp(power, max=0.0)), 0.0, 0.99)  # (sub_H, sub_W, C)
-
-            # Front-to-back compositing
-            for i in range(alpha.shape[-1]):
-                a = alpha[..., i]
-                weight = sub_T * a
-                sub_out += weight.unsqueeze(-1) * c_chunk[i]
-                sub_T = sub_T * (1.0 - a)
-
-            out_image[min_y:max_y, min_x:max_x] = sub_out
-            transmittance[min_y:max_y, min_x:max_x] = sub_T
-
-            # Early stopping if all pixels are fully saturated
-            if (transmittance < 1e-4).all():
-                break
-
-        # Blend with background
         bg = torch.tensor(self.bg_color, device=device, dtype=torch.float32)
-        final_image = out_image + transmittance.unsqueeze(-1) * bg
+
+        # Gaussian screen bounds
+        gx_min = means_2d[:, 0] - radii
+        gx_max = means_2d[:, 0] + radii
+        gy_min = means_2d[:, 1] - radii
+        gy_max = means_2d[:, 1] + radii
+
+        # Render image tile by tile to eliminate in-place slice assignment in autograd
+        tile_size = 32
+        n_tiles_y = (height + tile_size - 1) // tile_size
+        n_tiles_x = (width + tile_size - 1) // tile_size
+
+        tile_rows = []
+        for ty in range(n_tiles_y):
+            row_tiles = []
+            y0 = ty * tile_size
+            y1 = min(y0 + tile_size, height)
+
+            for tx in range(n_tiles_x):
+                x0 = tx * tile_size
+                x1 = min(x0 + tile_size, width)
+
+                # Find Gaussians overlapping this tile
+                in_tile = (gx_max >= x0) & (gx_min < x1) & (gy_max >= y0) & (gy_min < y1)
+
+                if not in_tile.any():
+                    # Empty tile
+                    row_tiles.append(bg.view(1, 1, 3).repeat(y1 - y0, x1 - x0, 1))
+                    continue
+
+                t_means = means_2d[in_tile]
+                t_inv = inv_cov[in_tile]
+                t_colors = colors[in_tile]
+                t_op = opacities[in_tile]
+
+                sub_pix = pixels[y0:y1, x0:x1]  # (th, tw, 2)
+                th, tw = sub_pix.shape[:2]
+
+                diff = sub_pix.unsqueeze(2) - t_means.unsqueeze(0).unsqueeze(0)  # (th, tw, K, 2)
+                power = -0.5 * (
+                    diff[..., 0] * (diff[..., 0] * t_inv[:, 0, 0] + diff[..., 1] * t_inv[:, 1, 0]) +
+                    diff[..., 1] * (diff[..., 0] * t_inv[:, 0, 1] + diff[..., 1] * t_inv[:, 1, 1])
+                )
+                alpha = torch.clamp(t_op * torch.exp(torch.clamp(power, max=0.0)), 0.0, 0.99)  # (th, tw, K)
+
+                # Out-of-place front-to-back alpha compositing for this tile
+                tile_out = torch.zeros((th, tw, 3), device=device, dtype=torch.float32)
+                tile_T = torch.ones((th, tw), device=device, dtype=torch.float32)
+
+                for k in range(alpha.shape[-1]):
+                    a = alpha[..., k]
+                    weight = tile_T * a
+                    tile_out = tile_out + weight.unsqueeze(-1) * t_colors[k]
+                    tile_T = tile_T * (1.0 - a)
+
+                final_tile = tile_out + tile_T.unsqueeze(-1) * bg
+                row_tiles.append(final_tile)
+
+            tile_rows.append(torch.cat(row_tiles, dim=1))
+
+        final_image = torch.cat(tile_rows, dim=0)
         return final_image.permute(2, 0, 1)  # (3, H, W)
+
 
 
 class SplatTrainer:
