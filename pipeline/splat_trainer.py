@@ -286,61 +286,68 @@ class DifferentiableSplatRenderer:
         gy_min = means_2d[:, 1] - radii
         gy_max = means_2d[:, 1] + radii
 
-        # Render image tile by tile to eliminate in-place slice assignment in autograd
-        tile_size = 32
-        n_tiles_y = (height + tile_size - 1) // tile_size
-        n_tiles_x = (width + tile_size - 1) // tile_size
+        # Render in 4 horizontal screen bands with fully vectorized CUDA compositing
+        band_h = 128
+        n_bands = (height + band_h - 1) // band_h
+        band_tensors = []
 
-        tile_rows = []
-        for ty in range(n_tiles_y):
-            row_tiles = []
-            y0 = ty * tile_size
-            y1 = min(y0 + tile_size, height)
+        for b in range(n_bands):
+            y0 = b * band_h
+            y1 = min(y0 + band_h, height)
+            sub_h = y1 - y0
 
-            for tx in range(n_tiles_x):
-                x0 = tx * tile_size
-                x1 = min(x0 + tile_size, width)
+            in_band = (gy_max >= y0) & (gy_min < y1)
+            if not in_band.any():
+                band_tensors.append(bg.view(1, 1, 3).repeat(sub_h, width, 1))
+                continue
 
-                # Find Gaussians overlapping this tile
-                in_tile = (gx_max >= x0) & (gx_min < x1) & (gy_max >= y0) & (gy_min < y1)
+            b_means = means_2d[in_band]
+            b_inv = inv_cov[in_band]
+            b_colors = colors[in_band]
+            b_op = opacities[in_band]
 
-                if not in_tile.any():
-                    # Empty tile
-                    row_tiles.append(bg.view(1, 1, 3).repeat(y1 - y0, x1 - x0, 1))
-                    continue
+            sub_pix = pixels[y0:y1, :]  # (sub_h, width, 2)
+            band_color = torch.zeros((sub_h, width, 3), device=device, dtype=torch.float32)
+            band_T = torch.ones((sub_h, width, 1), device=device, dtype=torch.float32)
 
-                t_means = means_2d[in_tile]
-                t_inv = inv_cov[in_tile]
-                t_colors = colors[in_tile]
-                t_op = opacities[in_tile]
+            # Process in vectorized chunks of 64 Gaussians
+            chunk_k = 64
+            n_gauss = b_means.shape[0]
 
-                sub_pix = pixels[y0:y1, x0:x1]  # (th, tw, 2)
-                th, tw = sub_pix.shape[:2]
+            for s in range(0, n_gauss, chunk_k):
+                e = min(s + chunk_k, n_gauss)
+                c_means = b_means[s:e]
+                c_inv = b_inv[s:e]
+                c_colors = b_colors[s:e]
+                c_op = b_op[s:e]
 
-                diff = sub_pix.unsqueeze(2) - t_means.unsqueeze(0).unsqueeze(0)  # (th, tw, K, 2)
+                diff = sub_pix.unsqueeze(2) - c_means.unsqueeze(0).unsqueeze(0)  # (sub_h, w, K, 2)
                 power = -0.5 * (
-                    diff[..., 0] * (diff[..., 0] * t_inv[:, 0, 0] + diff[..., 1] * t_inv[:, 1, 0]) +
-                    diff[..., 1] * (diff[..., 0] * t_inv[:, 0, 1] + diff[..., 1] * t_inv[:, 1, 1])
+                    diff[..., 0]**2 * c_inv[:, 0, 0] +
+                    2.0 * diff[..., 0] * diff[..., 1] * c_inv[:, 0, 1] +
+                    diff[..., 1]**2 * c_inv[:, 1, 1]
                 )
-                alpha = torch.clamp(t_op * torch.exp(torch.clamp(power, max=0.0)), 0.0, 0.99)  # (th, tw, K)
+                alpha = c_op * torch.exp(torch.clamp(power, max=0.0))  # (sub_h, w, K)
+                alpha = torch.clamp(alpha, 0.0, 0.99)
 
-                # Out-of-place front-to-back alpha compositing for this tile
-                tile_out = torch.zeros((th, tw, 3), device=device, dtype=torch.float32)
-                tile_T = torch.ones((th, tw), device=device, dtype=torch.float32)
+                # Vectorized front-to-back alpha compositing (zero Python loops!)
+                one_minus_a = 1.0 - alpha
+                c_T = torch.cumprod(one_minus_a, dim=-1)
+                weights = torch.cat([torch.ones_like(alpha[..., :1]), c_T[..., :-1]], dim=-1) * alpha
+                chunk_color = torch.einsum('hwk,kc->hwc', weights, c_colors)
 
-                for k in range(alpha.shape[-1]):
-                    a = alpha[..., k]
-                    weight = tile_T * a
-                    tile_out = tile_out + weight.unsqueeze(-1) * t_colors[k]
-                    tile_T = tile_T * (1.0 - a)
+                band_color = band_color + band_T * chunk_color
+                band_T = band_T * c_T[..., -1:]
 
-                final_tile = tile_out + tile_T.unsqueeze(-1) * bg
-                row_tiles.append(final_tile)
+                if (band_T < 1e-3).all():
+                    break
 
-            tile_rows.append(torch.cat(row_tiles, dim=1))
+            final_band = band_color + band_T * bg
+            band_tensors.append(final_band)
 
-        final_image = torch.cat(tile_rows, dim=0)
+        final_image = torch.cat(band_tensors, dim=0)
         return final_image.permute(2, 0, 1)  # (3, H, W)
+
 
 
 
