@@ -238,7 +238,9 @@ class DifferentiableSplatRenderer:
         projected: Dict[str, torch.Tensor],
         width: int,
         height: int,
-        tile_size: int = 16
+        tile_size: int = 16,
+        sharpness_multiplier: float = 1.0,
+        opacity_boost: float = 1.0
     ) -> torch.Tensor:
         """
         Renders projected Gaussians into a (3, H, W) image using depth sorting
@@ -254,9 +256,9 @@ class DifferentiableSplatRenderer:
         # Sort front-to-back by camera depth
         sort_idx = torch.argsort(depths)
         means_2d = means_2d[sort_idx]
-        cov2d = cov2d[sort_idx]
+        cov2d = cov2d[sort_idx] * sharpness_multiplier
         colors = colors[sort_idx]
-        opacities = opacities[sort_idx]
+        opacities = torch.clamp(opacities[sort_idx] * opacity_boost, 0.0, 0.99)
 
         # Compute inverse 2D covariance for Gaussian falloff: exp(-0.5 * d^T * inv(cov) * d)
         det = cov2d[:, 0, 0] * cov2d[:, 1, 1] - cov2d[:, 0, 1] * cov2d[:, 1, 0]
@@ -286,67 +288,120 @@ class DifferentiableSplatRenderer:
         gy_min = means_2d[:, 1] - radii
         gy_max = means_2d[:, 1] + radii
 
-        # Render in 4 horizontal screen bands with fully vectorized CUDA compositing
-        band_h = 128
-        n_bands = (height + band_h - 1) // band_h
-        band_tensors = []
-
-        for b in range(n_bands):
-            y0 = b * band_h
-            y1 = min(y0 + band_h, height)
-            sub_h = y1 - y0
-
-            in_band = (gy_max >= y0) & (gy_min < y1)
-            if not in_band.any():
-                band_tensors.append(bg.view(1, 1, 3).repeat(sub_h, width, 1))
-                continue
-
-            b_means = means_2d[in_band]
-            b_inv = inv_cov[in_band]
-            b_colors = colors[in_band]
-            b_op = opacities[in_band]
-
-            sub_pix = pixels[y0:y1, :]  # (sub_h, width, 2)
-            band_color = torch.zeros((sub_h, width, 3), device=device, dtype=torch.float32)
-            band_T = torch.ones((sub_h, width, 1), device=device, dtype=torch.float32)
-
-            # Process in vectorized chunks of 64 Gaussians
-            chunk_k = 64
-            n_gauss = b_means.shape[0]
+        # 1. Seamless Full-Frame Inference Mode (when gradients not required: eval, novel views, orbit)
+        if not torch.is_grad_enabled():
+            out_color = torch.zeros((height, width, 3), device=device, dtype=torch.float32)
+            out_T = torch.ones((height, width, 1), device=device, dtype=torch.float32)
+            n_gauss = means_2d.shape[0]
+            chunk_k = 128
+            px = pixels[..., 0:1]
+            py = pixels[..., 1:2]
 
             for s in range(0, n_gauss, chunk_k):
                 e = min(s + chunk_k, n_gauss)
-                c_means = b_means[s:e]
-                c_inv = b_inv[s:e]
-                c_colors = b_colors[s:e]
-                c_op = b_op[s:e]
+                c_means = means_2d[s:e]
+                c_inv = inv_cov[s:e]
+                c_colors = colors[s:e]
+                c_op = opacities[s:e]
 
-                diff = sub_pix.unsqueeze(2) - c_means.unsqueeze(0).unsqueeze(0)  # (sub_h, w, K, 2)
+                dx = px - c_means[:, 0]
+                dy = py - c_means[:, 1]
                 power = -0.5 * (
-                    diff[..., 0]**2 * c_inv[:, 0, 0] +
-                    2.0 * diff[..., 0] * diff[..., 1] * c_inv[:, 0, 1] +
-                    diff[..., 1]**2 * c_inv[:, 1, 1]
+                    dx**2 * c_inv[:, 0, 0] +
+                    2.0 * dx * dy * c_inv[:, 0, 1] +
+                    dy**2 * c_inv[:, 1, 1]
                 )
-                alpha = c_op * torch.exp(torch.clamp(power, max=0.0))  # (sub_h, w, K)
+                alpha = c_op * torch.exp(torch.clamp(power, max=0.0))
                 alpha = torch.clamp(alpha, 0.0, 0.99)
 
-                # Vectorized front-to-back alpha compositing (zero Python loops!)
                 one_minus_a = 1.0 - alpha
                 c_T = torch.cumprod(one_minus_a, dim=-1)
                 weights = torch.cat([torch.ones_like(alpha[..., :1]), c_T[..., :-1]], dim=-1) * alpha
                 chunk_color = torch.einsum('hwk,kc->hwc', weights, c_colors)
 
-                band_color = band_color + band_T * chunk_color
-                band_T = band_T * c_T[..., -1:]
+                out_color = out_color + out_T * chunk_color
+                out_T = out_T * c_T[..., -1:]
 
-                if (band_T < 1e-3).all():
+                if (out_T < 1e-3).all():
                     break
 
-            final_band = band_color + band_T * bg
-            band_tensors.append(final_band)
+            final_image = out_color + out_T * bg
+            return final_image.permute(2, 0, 1)
 
-        final_image = torch.cat(band_tensors, dim=0)
-        return final_image.permute(2, 0, 1)  # (3, H, W)
+        # 2. Tile-Based Differentiable Training Mode (bounds peak autograd VRAM to < 750 MB)
+        tile_w = 64
+        tile_h = 64
+        n_tiles_x = (width + tile_w - 1) // tile_w
+        n_tiles_y = (height + tile_h - 1) // tile_h
+        row_tensors = []
+
+        chunk_k = 64
+        max_gauss_per_tile = 384
+
+        for ty in range(n_tiles_y):
+            y0 = ty * tile_h
+            y1 = min(y0 + tile_h, height)
+            sub_h = y1 - y0
+
+            col_tensors = []
+            for tx in range(n_tiles_x):
+                x0 = tx * tile_w
+                x1 = min(x0 + tile_w, width)
+                sub_w = x1 - x0
+
+                in_tile = (gx_max >= x0) & (gx_min < x1) & (gy_max >= y0) & (gy_min < y1)
+                if not in_tile.any():
+                    col_tensors.append(bg.view(1, 1, 3).repeat(sub_h, sub_w, 1))
+                    continue
+
+                t_means = means_2d[in_tile][:max_gauss_per_tile]
+                t_inv = inv_cov[in_tile][:max_gauss_per_tile]
+                t_colors = colors[in_tile][:max_gauss_per_tile]
+                t_op = opacities[in_tile][:max_gauss_per_tile]
+
+                tile_pix = pixels[y0:y1, x0:x1]
+                t_px = tile_pix[..., 0:1]
+                t_py = tile_pix[..., 1:2]
+                tile_color = torch.zeros((sub_h, sub_w, 3), device=device, dtype=torch.float32)
+                tile_T = torch.ones((sub_h, sub_w, 1), device=device, dtype=torch.float32)
+
+                n_gauss = t_means.shape[0]
+                for s in range(0, n_gauss, chunk_k):
+                    e = min(s + chunk_k, n_gauss)
+                    c_means = t_means[s:e]
+                    c_inv = t_inv[s:e]
+                    c_colors = t_colors[s:e]
+                    c_op = t_op[s:e]
+
+                    dx = t_px - c_means[:, 0]
+                    dy = t_py - c_means[:, 1]
+                    power = -0.5 * (
+                        dx**2 * c_inv[:, 0, 0] +
+                        2.0 * dx * dy * c_inv[:, 0, 1] +
+                        dy**2 * c_inv[:, 1, 1]
+                    )
+                    alpha = c_op * torch.exp(torch.clamp(power, max=0.0))
+                    alpha = torch.clamp(alpha, 0.0, 0.99)
+
+                    one_minus_a = 1.0 - alpha
+                    c_T = torch.cumprod(one_minus_a, dim=-1)
+                    weights = torch.cat([torch.ones_like(alpha[..., :1]), c_T[..., :-1]], dim=-1) * alpha
+                    chunk_color = torch.einsum('hwk,kc->hwc', weights, c_colors)
+
+                    tile_color = tile_color + tile_T * chunk_color
+                    tile_T = tile_T * c_T[..., -1:]
+
+                    if (tile_T < 1e-3).all():
+                        break
+
+                final_tile = tile_color + tile_T * bg
+                col_tensors.append(final_tile)
+
+            row_tensor = torch.cat(col_tensors, dim=1)
+            row_tensors.append(row_tensor)
+
+        final_image = torch.cat(row_tensors, dim=0)
+        return final_image.permute(2, 0, 1)
 
 
 
