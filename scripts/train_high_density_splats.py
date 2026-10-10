@@ -171,7 +171,7 @@ def train_high_density(
 
     # Copy to artifact folder
     import shutil, glob
-    art_dir = r"output/renders"
+    art_dir = os.environ.get("ARTIFACTS_DIR", os.path.join(os.path.abspath("."), "output", "renders"))
     for f in glob.glob("output/renders/*.*"):
         shutil.copy(f, os.path.join(art_dir, os.path.basename(f)))
     print("Copied updated renders to artifact directory for inspection.")

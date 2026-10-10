@@ -196,7 +196,7 @@ def render_novel_views_and_orbit(
         print(f"Orbit animation saved to: {orbit_gif_path} and {orbit_webp_path}")
 
     # Copy to artifact folder for IDE preview
-    art_dir = r"output/renders"
+    art_dir = os.environ.get("ARTIFACTS_DIR", os.path.join(os.path.abspath("."), "output", "renders"))
     if os.path.exists(art_dir):
         import shutil, glob
         for f in glob.glob(os.path.join(out_dir, "*.*")):

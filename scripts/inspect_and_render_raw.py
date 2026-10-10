@@ -86,7 +86,7 @@ def inspect_and_render_raw(
         print(f"Rendered RAW novel view {i+1}/{n_views}: {out_path}")
 
     # Copy raw renders to artifact directory for side-by-side inspection
-    art_dir = r"output/renders"
+    art_dir = os.environ.get("ARTIFACTS_DIR", os.path.join(os.path.abspath("."), "output", "renders"))
     if os.path.exists(art_dir):
         import shutil
         for p in raw_paths:
