@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import hashlib
 import torch
 import numpy as np
 from typing import List, Dict, Tuple, Optional
@@ -38,6 +39,7 @@ class DUSt3RGeometryEstimator:
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
         self.confidence_threshold = confidence_threshold
+        self.model_name = model_name
         print(f"[DUSt3R] Initializing model '{model_name}' on {self.device} (dtype: {self.dtype})...")
         self.model = AsymmetricCroCo3DStereo.from_pretrained(model_name).to(self.device, dtype=self.dtype)
         self.model.eval()
@@ -50,7 +52,8 @@ class DUSt3RGeometryEstimator:
         scene_graph_type: str = "consecutive",
         step: int = 1,
         n_iters: int = 200,
-        voxel_downsample: float = 0.02
+        voxel_downsample: float = 0.02,
+        use_cache: bool = True
     ) -> Dict:
         """
         Runs DUSt3R pairwise inference and global alignment across image_paths.
@@ -67,15 +70,35 @@ class DUSt3RGeometryEstimator:
         pairs = make_pairs(images, scene_graph="swin-3-noncyclic", symmetrize=True)
         print(f"[DUSt3R] Formed {len(pairs)} pairwise graph edges for inference.")
 
-        # 3. Run pairwise inference in fp16, batch_size=1 to ensure peak VRAM < 3.5GB
-        with torch.no_grad():
-            output = inference(
-                pairs,
-                self.model,
-                self.device,
-                batch_size=1,
-                verbose=True
-            )
+        # 3. Content-addressed pairwise cache (keyed on model, graph, resolution, and image paths in pair order)
+        cache_str = f"model={self.model_name}|graph={scene_graph_type}|res=512|" + "|".join(
+            f"{os.path.basename(p)}:{os.path.getmtime(p) if os.path.exists(p) else 0}" for p in image_paths
+        )
+        cache_hash = hashlib.sha256(cache_str.encode("utf-8")).hexdigest()[:16]
+        cache_path = os.path.join(output_dir, f"pairwise_cache_{cache_hash}.pt")
+        legacy_cache_path = os.path.join(output_dir, "pairwise_cache.pt")
+
+        if use_cache and os.path.exists(cache_path):
+            print(f"[DUSt3R] Loading content-addressed pairwise cache ({cache_hash}) from {cache_path}...")
+            output = torch.load(cache_path, map_location="cpu")
+        elif use_cache and os.path.exists(legacy_cache_path) and len(image_paths) == 65:
+            print(f"[DUSt3R] Loading legacy pairwise cache from {legacy_cache_path}...")
+            output = torch.load(legacy_cache_path, map_location="cpu")
+        else:
+            with torch.no_grad():
+                output = inference(
+                    pairs,
+                    self.model,
+                    self.device,
+                    batch_size=1,
+                    verbose=True
+                )
+            if use_cache:
+                try:
+                    torch.save(output, cache_path)
+                    print(f"[DUSt3R] Cached pairwise output to {cache_path}")
+                except Exception as e:
+                    print(f"[DUSt3R] Warning: could not cache pairwise output: {e}")
 
 
         # Clear PyTorch caching to free activation memory before global alignment
