@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import math
 import hashlib
 import torch
 import numpy as np
@@ -52,7 +53,13 @@ class DUSt3RGeometryEstimator:
         scene_graph_type: str = "consecutive",
         step: int = 1,
         n_iters: int = 200,
-        voxel_downsample: float = 0.02,
+        voxel_downsample: Optional[float] = None,
+        voxel_downsample_ratio: float = 0.012,
+        stratified_sampling: bool = True,
+        heldout_eval: bool = False,
+        heldout_step: int = 5,
+        dedup_voxel_size: Optional[float] = None,
+        dedup_voxel_ratio: float = 0.004,
         use_cache: bool = True
     ) -> Dict:
         """
@@ -100,7 +107,6 @@ class DUSt3RGeometryEstimator:
                 except Exception as e:
                     print(f"[DUSt3R] Warning: could not cache pairwise output: {e}")
 
-
         # Clear PyTorch caching to free activation memory before global alignment
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -108,7 +114,6 @@ class DUSt3RGeometryEstimator:
         print(f"[DUSt3R] Pairwise inference complete. Starting global alignment ({n_iters} iterations)...")
 
         # 4. Global alignment: solves for globally consistent camera poses and point scale
-        # Use GlobalAlignerMode.PointCloudOptimizer or pairwise optimizer
         scene = global_aligner(
             output,
             device=self.device,
@@ -147,6 +152,36 @@ class DUSt3RGeometryEstimator:
         pts3d = scene.get_pts3d()  # list of (H, W, 3)
         confs = scene.get_conf()   # list of (H, W)
 
+        # Compute scene extent from estimated camera path length
+        cam_positions = np.array([p[:3, 3] for p in poses]) if len(poses) > 0 else np.zeros((0, 3))
+        if len(cam_positions) > 1:
+            path_len = float(np.sum(np.linalg.norm(np.diff(cam_positions, axis=0), axis=1)))
+        else:
+            path_len = 0.0
+
+        if path_len > 1e-4:
+            scene_extent = path_len
+        else:
+            # Fallback to bounding box diagonal of confident points
+            all_valid_pts = []
+            for p_t, c_t in zip(pts3d, confs):
+                p_np = p_t.detach().cpu().numpy() if torch.is_tensor(p_t) else np.array(p_t)
+                c_np = c_t.detach().cpu().numpy() if torch.is_tensor(c_t) else np.array(c_t)
+                valid = p_np[c_np > self.confidence_threshold]
+                if len(valid) > 0:
+                    all_valid_pts.append(valid)
+            if len(all_valid_pts) > 0:
+                merged_v = np.concatenate(all_valid_pts, axis=0)
+                scene_extent = float(np.linalg.norm(np.max(merged_v, axis=0) - np.min(merged_v, axis=0)))
+            else:
+                scene_extent = 1.0
+
+        # Derive scene-relative spatial thresholds
+        norm_cutoff = max(scene_extent * 5.0, 10.0)
+        eff_dedup_voxel = dedup_voxel_size if dedup_voxel_size is not None else scene_extent * dedup_voxel_ratio
+        eff_voxel_downsample = voxel_downsample if voxel_downsample is not None else scene_extent * voxel_downsample_ratio
+        print(f"[DUSt3R] Scene extent: {scene_extent:.4f} units (path length: {path_len:.4f}). Relative thresholds: norm_cutoff={norm_cutoff:.1f}, dedup_voxel={eff_dedup_voxel:.5f}, downsample_voxel={eff_voxel_downsample:.5f}")
+
         camera_data = []
         all_points = []
         all_colors = []
@@ -177,36 +212,71 @@ class DUSt3RGeometryEstimator:
             }
             camera_data.append(cam_info)
 
-            # Filter dense 3D points by confidence
+            # If heldout_eval is enabled, withhold test frames from contributing 3D seeds
+            if heldout_eval and (idx % heldout_step == (heldout_step - 1)):
+                continue
+
+            # Extract dense 3D points
             p3d_tensor = pts3d[idx]
             p3d = p3d_tensor.detach().cpu().numpy() if torch.is_tensor(p3d_tensor) else np.array(p3d_tensor)
             conf_tensor = confs[idx]
             conf = conf_tensor.detach().cpu().numpy() if torch.is_tensor(conf_tensor) else np.array(conf_tensor)
             rgb = (images[idx]["img"][0].permute(1, 2, 0).detach().cpu().numpy() + 1.0) / 2.0  # (H, W, 3) in [0, 1]
 
-
-            mask = conf > self.confidence_threshold
-            valid_p3d = p3d[mask]
-            valid_rgb = rgb[mask]
-
-            if len(valid_p3d) > 0:
-                all_points.append(valid_p3d)
-                all_colors.append(valid_rgb)
+            if stratified_sampling:
+                H_img, W_img = p3d.shape[:2]
+                target_cells = 1600
+                aspect = W_img / max(H_img, 1)
+                grid_cols = max(1, int(round(math.sqrt(target_cells * aspect))))
+                grid_rows = max(1, int(round(math.sqrt(target_cells / aspect))))
+                row_bins = np.linspace(0, H_img, grid_rows + 1, dtype=int)
+                col_bins = np.linspace(0, W_img, grid_cols + 1, dtype=int)
+                for r in range(grid_rows):
+                    r0, r1 = row_bins[r], row_bins[r + 1]
+                    for c in range(grid_cols):
+                        c0, c1 = col_bins[c], col_bins[c + 1]
+                        cell_conf = conf[r0:r1, c0:c1]
+                        if np.any(cell_conf >= 0.8):
+                            lr, lc = np.unravel_index(np.argmax(cell_conf), cell_conf.shape)
+                            best_y, best_x = r0 + lr, c0 + lc
+                        elif np.any(cell_conf > 0.2):
+                            lr, lc = np.unravel_index(np.argmax(cell_conf), cell_conf.shape)
+                            best_y, best_x = r0 + lr, c0 + lc
+                        else:
+                            continue
+                        pt = p3d[best_y, best_x]
+                        if np.all(np.isfinite(pt)) and np.linalg.norm(pt) < norm_cutoff:
+                            all_points.append(pt)
+                            all_colors.append(rgb[best_y, best_x])
+            else:
+                mask = conf > self.confidence_threshold
+                valid_p3d = p3d[mask]
+                valid_rgb = rgb[mask]
+                if len(valid_p3d) > 0:
+                    for pt, col in zip(valid_p3d, valid_rgb):
+                        if np.all(np.isfinite(pt)) and np.linalg.norm(pt) < norm_cutoff:
+                            all_points.append(pt)
+                            all_colors.append(col)
 
         cameras_json_path = os.path.join(output_dir, "cameras.json")
         with open(cameras_json_path, "w") as f:
             json.dump(camera_data, f, indent=2)
 
-        merged_pts = np.concatenate(all_points, axis=0).astype(np.float32)
-        merged_colors = np.concatenate(all_colors, axis=0).astype(np.float32)
-        print(f"[DUSt3R] Total confident 3D points before voxel downsampling: {len(merged_pts)}")
+        merged_pts = np.array(all_points, dtype=np.float32)
+        merged_colors = np.array(all_colors, dtype=np.float32)
+        print(f"[DUSt3R] Total extracted 3D points before deduplication: {len(merged_pts):,}")
 
-        # Voxel downsample point cloud
-        if voxel_downsample > 0:
+        if stratified_sampling and eff_dedup_voxel is not None and eff_dedup_voxel > 0 and len(merged_pts) > 0:
+            coords = np.floor(merged_pts / eff_dedup_voxel).astype(np.int64)
+            _, unique_idx = np.unique(coords, axis=0, return_index=True)
+            merged_pts = merged_pts[unique_idx]
+            merged_colors = merged_colors[unique_idx]
+            print(f"[DUSt3R] Points after spatial deduplication ({eff_dedup_voxel:.4f}m grid): {len(merged_pts):,}")
+        elif eff_voxel_downsample is not None and eff_voxel_downsample > 0 and len(merged_pts) > 0:
             from pipeline.splat_init import SplatInitializer
             init_helper = SplatInitializer()
-            merged_pts, merged_colors = init_helper.voxel_downsample(merged_pts, merged_colors, voxel_downsample)
-            print(f"[DUSt3R] Confident points after voxel downsampling ({voxel_downsample}m): {len(merged_pts)}")
+            merged_pts, merged_colors = init_helper.voxel_downsample(merged_pts, merged_colors, eff_voxel_downsample)
+            print(f"[DUSt3R] Confident points after voxel downsampling ({eff_voxel_downsample:.4f}m): {len(merged_pts):,}")
 
         # Save point cloud as PLY
         ply_path = os.path.join(output_dir, "dust3r_points.ply")
