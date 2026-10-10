@@ -3,6 +3,7 @@ import sys
 import json
 import math
 import time
+from typing import Optional, List, Dict, Tuple
 import cv2
 import numpy as np
 import plyfile
@@ -154,27 +155,35 @@ class GSplatTrainer:
             "colors": torch.optim.Adam([self.params["colors"]], lr=2.5e-3, eps=1e-15),
         }
 
-    def train(self, total_iterations: int = 15000, output_ply: str = "output/splats/room_splat.ply") -> str:
+    def train(
+        self,
+        total_iterations: int = 5000,
+        output_ply: str = "output/splats/room_splat.ply",
+        strategy: Optional[DefaultStrategy] = None
+    ) -> str:
         os.makedirs(os.path.dirname(output_ply), exist_ok=True)
         print(f"\n[GSplatTrainer] Starting training for {total_iterations} iterations...")
         print(f"[GSplatTrainer] Initial Gaussians: {len(self.params['means']):,}")
 
-        # 5. Adaptive Densification Strategy (DefaultStrategy) scaled to total_iterations
-        refine_stop = int(total_iterations * 0.85)
-        reset_iter = max(1000, total_iterations // 5)
-        self.strategy = DefaultStrategy(
-            prune_opa=0.005,
-            grow_grad2d=0.0002,
-            grow_scale3d=0.01,
-            refine_start_iter=500,
-            refine_stop_iter=refine_stop,
-            refine_every=100,
-            reset_every=reset_iter,
-            absgrad=True,
-            verbose=False
-        )
+        # 5. Adaptive Densification Strategy (DefaultStrategy): Preserve caller strategy if set
+        if strategy is not None:
+            self.strategy = strategy
+        elif not hasattr(self, "strategy") or self.strategy is None:
+            refine_stop = int(total_iterations * 0.5)
+            reset_iter = max(1000, total_iterations // 4)
+            self.strategy = DefaultStrategy(
+                prune_opa=0.005,
+                grow_grad2d=0.0002,
+                grow_scale3d=0.01,
+                refine_start_iter=200,
+                refine_stop_iter=refine_stop,
+                refine_every=100,
+                reset_every=reset_iter,
+                absgrad=True,
+                verbose=False
+            )
         self.strategy_state = self.strategy.initialize_state(scene_scale=self.scene_scale)
-        print(f"[GSplatTrainer] Densification strategy: refine 500 -> {refine_stop}, reset every {reset_iter}, grow_grad2d=0.0002")
+        print(f"[GSplatTrainer] Densification strategy active: prune_opa={self.strategy.prune_opa}, grow_grad2d={self.strategy.grow_grad2d}, refine_stop={self.strategy.refine_stop_iter}")
 
         start_time = time.time()
         pbar = tqdm(range(total_iterations), desc="Training gsplat")
