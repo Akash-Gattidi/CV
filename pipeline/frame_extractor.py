@@ -8,7 +8,7 @@ class FrameExtractor:
     """
     Extracts, filters (for sharpness/blur), and downsamples video frames
     to prepare clean keyframes for DUSt3R/MASt3R and Gaussian Splatting,
-    optimized to fit strictly within low-VRAM GPU.
+    optimized to fit strictly within consumer low-VRAM GPU memory budgets.
     """
     def __init__(
         self,
@@ -107,7 +107,7 @@ class FrameExtractor:
                 candidate_window.sort(key=lambda x: x[2], reverse=True)
                 best_idx, best_frame, best_sharpness = candidate_window[0]
 
-                # Resize to fit low-VRAM GPU constraint
+                # Resize to fit low-VRAM constraint
                 resized_frame = self.resize_frame(best_frame)
                 timestamp = best_idx / video_fps
                 out_filename = f"frame_{len(extracted_metadata):04d}.jpg"
@@ -151,11 +151,11 @@ class FrameExtractor:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Extract keyframes from video")
-    parser.add_argument("--video", type=str, default="single room.mp4", help="Path to input video")
+    parser.add_argument("--video", type=str, required=True, help="Path to input video (e.g. input/video.mp4)")
     parser.add_argument("--start", type=float, default=0.0, help="Start time in seconds")
     parser.add_argument("--end", type=float, default=None, help="End time in seconds")
     parser.add_argument("--fps", type=float, default=2.0, help="Target FPS")
-    parser.add_argument("--max_dim", type=int, default=512, help="Max image dimension for low-VRAM GPU")
+    parser.add_argument("--max_dim", type=int, default=512, help="Max image dimension for low-VRAM GPUs")
     parser.add_argument("--out_dir", type=str, default="output/frames", help="Output directory")
     args = parser.parse_args()
 

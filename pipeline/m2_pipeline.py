@@ -209,8 +209,8 @@ def render_m2_evaluation(
         anim_frames[0].save(orbit_webp, save_all=True, append_images=anim_frames[1:], duration=50, loop=0)
         print(f"[M2 Evaluation] Walkthrough animations saved to {orbit_gif}, {orbit_webp}, {orbit_mp4}")
 
-    # 4. Sync assets to brain artifact directory if env var set
-    art_dir = os.environ.get("ARTIFACTS_DIR", os.environ.get("ARTIFACTS_DIR"))
+    # 4. Sync assets to artifact directory if env var set
+    art_dir = os.environ.get("ARTIFACTS_DIR")
     if art_dir and os.path.exists(art_dir):
         import shutil
         shutil.copy(grid_path, os.path.join(art_dir, "m2_multiroom_comparison_grid.jpg"))

@@ -45,7 +45,7 @@ class SplatInitializer:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Downsamples point cloud using a regular 3D voxel grid.
-        Keeps Gaussian count well-conditioned for <= low-VRAM GPU training.
+        Keeps Gaussian count well-conditioned for low-VRAM GPU training.
         """
         if len(points) == 0:
             return points, colors
@@ -84,7 +84,7 @@ class SplatInitializer:
             points, colors = self.voxel_downsample(points, colors, voxel_size)
             print(f"[SplatInit] Points after voxel downsampling ({voxel_size}m): {len(points)}")
 
-        # Step 2: Cap max initial points if needed for low-VRAM GPU safety
+        # Step 2: Cap max initial points if needed for low-VRAM memory safety
         if len(points) > max_initial_points:
             subsample_idx = np.random.choice(len(points), max_initial_points, replace=False)
             points = points[subsample_idx]

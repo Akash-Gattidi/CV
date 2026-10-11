@@ -16,7 +16,7 @@ from pipeline.splat_init import SplatInitializer
 from pipeline.splat_trainer import GaussianModel, SplatTrainer
 
 def run_milestone_1(
-    video_path: str = "single room.mp4",
+    video_path: str = "input/video.mp4",
     start_sec: float = 0.0,
     end_sec: float = None,
     target_fps: float = 2.0,
@@ -87,7 +87,7 @@ def run_milestone_1(
     gaussians = GaussianModel(init_params=init_params, device="cuda")
     print(f"Step 3 Complete: {gaussians.get_xyz.shape[0]} Gaussians initialized.")
 
-    # Step 4: Gaussian Splat Training per Room Segment (< low-VRAM GPU)
+    # Step 4: Gaussian Splat Training per Room Segment (low-VRAM GPU)
     print(f"\n--- STEP 4: 3D GAUSSIAN SPLAT TRAINING ({iterations} ITERATIONS) ---")
     splat_dir = os.path.join("output", "splats")
     trainer = SplatTrainer(gaussians=gaussians, cameras=dust3r_results["cameras"])
@@ -110,11 +110,11 @@ def run_milestone_1(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run Milestone 1 Single-Room Pipeline")
-    parser.add_argument("--video", type=str, default="single room.mp4", help="Path to input video")
+    parser.add_argument("--video", type=str, required=True, help="Path to input video (e.g. input/video.mp4)")
     parser.add_argument("--start", type=float, default=0.0, help="Start time in seconds")
     parser.add_argument("--end", type=float, default=None, help="End time in seconds")
     parser.add_argument("--fps", type=float, default=2.0, help="Sampling FPS")
-    parser.add_argument("--max_dim", type=int, default=512, help="Max image dimension for low-VRAM GPU")
+    parser.add_argument("--max_dim", type=int, default=512, help="Max image dimension for low-VRAM GPUs")
     parser.add_argument("--iters", type=int, default=500, help="Splat training iterations")
     parser.add_argument("--voxel", type=float, default=0.02, help="Voxel size in meters")
     args = parser.parse_args()

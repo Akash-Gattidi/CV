@@ -28,7 +28,7 @@ class DUSt3RGeometryEstimator:
     """
     Runs DUSt3R dense geometric reconstruction and camera pose estimation.
     Engineered to handle low-texture/blank walls where COLMAP fails,
-    with strict memory optimizations to remain within low-VRAM GPU.
+    with strict memory optimizations designed for consumer low-VRAM GPUs.
     """
     def __init__(
         self,

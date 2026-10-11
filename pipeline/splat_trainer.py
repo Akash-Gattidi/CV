@@ -151,7 +151,7 @@ class DifferentiableSplatRenderer:
     """
     Lightweight, vectorized GPU splat rasterizer in pure PyTorch.
     Projects 3D Gaussians into 2D camera coordinates and alpha-blends tiles/pixels,
-    guaranteed to execute cleanly within low-VRAM GPU without external C++ compilers.
+    guaranteed to execute cleanly on low-VRAM GPUs without external C++ compilers.
     """
     def __init__(self, bg_color: Tuple[float, float, float] = (1.0, 1.0, 1.0)):
         self.bg_color = bg_color
