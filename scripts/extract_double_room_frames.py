@@ -9,8 +9,14 @@ if PROJECT_ROOT not in sys.path:
 from pipeline.frame_extractor import FrameExtractor
 
 def main():
-    video_path = "double room.mp4"
-    output_dir = "output/frames_double"
+    import argparse
+    parser = argparse.ArgumentParser(description="Extract keyframes for multi-room reconstruction")
+    parser.add_argument("--video", type=str, default="input/input_video.mp4", help="Path to input video")
+    parser.add_argument("--out_dir", type=str, default="output/frames_double", help="Output directory")
+    args = parser.parse_args()
+
+    video_path = args.video
+    output_dir = args.out_dir
     os.makedirs(output_dir, exist_ok=True)
 
     # 52s video -> at 1.8-2.0 fps with blur filtering gives ~90-100 high-quality keyframes

@@ -2,7 +2,7 @@ import os
 import cv2
 import json
 
-def inspect_video(video_path="double room.mp4"):
+def inspect_video(video_path="input/input_video.mp4"):
     if not os.path.exists(video_path):
         print(f"Error: {video_path} not found.")
         return

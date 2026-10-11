@@ -33,7 +33,7 @@ def verify():
 
     print("\n--- TEST CRITERIA ASSESSMENT ---")
     print("[PASS] Handled blank/low-texture walls without COLMAP feature-matching collapse.")
-    print("[PASS] Zero out-of-memory errors on target low-VRAM GPU (peak VRAM < 3.2 GB).")
+    print("[PASS] Zero out-of-memory errors on target low-VRAM GPU.")
     print("[PASS] Produced exportable 3D Gaussian Splat model (room_splat.ply).")
     print("==================================================")
 
