@@ -1,21 +1,59 @@
+# Environments and dependencies
 .venv/
 __pycache__/
 *.pyc
-*.ply
-*.splat
+
+# Data and pipeline directories
+input/
 output/
+renders/
+frames/
 temp/
+scratch/
+checkpoints/
+dust3r_repo/
+
+# Videos
 *.mp4
 *.mov
 *.avi
 *.mkv
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+
+# Point clouds, 3D splats, and model weights
+*.ply
+*.splat
+*.pt
+*.pth
+*.ckpt
+*.npz
+
+# Reconstruction outputs & caches
+cameras.json
+pairwise_cache.pt
+pairwise_cache*.pt
+
+# Secrets, environment files, and credentials
+.env
 *.env
 *.env.*
 *.key
 *.pem
 *.secret
 credentials*
-dust3r_repo/
-checkpoints/
-scratch/
 
+# Logs
+logs/
+*.log
+
+# IDE and AI artifact directories
+.vscode/
+.idea/
+.gemini/
+.antigravity/
